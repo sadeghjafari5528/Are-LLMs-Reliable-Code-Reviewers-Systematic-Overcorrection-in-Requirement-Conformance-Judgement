@@ -1,4 +1,4 @@
-# Uncovering Systematic Failures of LLMs in Verifying Code Against Natural Language Specifications
+# Uncovering-Prompt-Induced-Bias-and-Explanation-Failures-in-LLM-Based-Code-Conformance-Judgement.
 
 This repository contains code to reproduce experiments from our paper on **LLM requirement–code conformance judgement** and the proposed **Fix-guided Verification Filter** to mitigate *over-correction* under rationale+fix prompting.
 
