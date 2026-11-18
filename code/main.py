@@ -44,15 +44,18 @@ from utils import (
     construct_generated_tests_v2_prompt,
     construct_prompt,
     construct_reference_input_prompt,
+    construct_reference_inputs_prompt,
     construct_signature_prompt,
-    extract_code_block,
+    extract_candidate_code,
     extract_generated_tests,
+    extract_test,
     function_name_from_signature,
     generate_reference_output_test,
     load_data,
     parse_function_signature,
     parse_response,
     parse_reference_input,
+    parse_reference_inputs,
     run_generated_tests,
     run_validated_tests,
     save_json,
@@ -69,7 +72,9 @@ DEFAULT_MODELS = [
     "mistralai/mistral-small-3.2-24b-instruct",
 ]
 
-DEFAULT_PROMPT_MODES = ["direct", "direct_explain", "full", "generated_tests", "generated_tests_v2"]
+DEFAULT_PROMPT_MODES = [
+    "direct", "direct_explain", "full", "generated_tests", "generated_tests_v2", "generated_tests_v3",
+]
 
 
 def read_jsonl_tolerant(path: Path) -> List[Dict[str, Any]]:
@@ -164,6 +169,46 @@ def build_model(model_name: str):
     raise ValueError(f"Unknown model: {model_name}")
 
 
+def prepare_reference(
+    check_requirement: Callable[[str], str], requirement: str, submitted_code: str, delay: float
+) -> Tuple[str, str, str, str]:
+    """Extract the signature and output format, then generate and validate a reference implementation."""
+    signature, output_format = parse_function_signature(
+        check_requirement(construct_signature_prompt(requirement, submitted_code)), submitted_code
+    )
+    function_name = function_name_from_signature(signature)
+    if delay:
+        time.sleep(delay)
+    candidate_raw = check_requirement(construct_candidate_prompt(requirement, signature, output_format))
+    candidate = extract_candidate_code(candidate_raw)
+    if not candidate:
+        raise ValueError("model returned an empty candidate implementation")
+    validate_candidate_signature(candidate, signature)
+    check_generated_candidate(candidate)
+    return signature, output_format, function_name, candidate
+
+
+def build_reference_output_test(
+    candidate: str, function_name: str, input_args: List[Any], input_kwargs: Dict[str, Any],
+    test_number: int, fingerprints: Set[str],
+) -> Dict[str, Any]:
+    """Run the reference on an input and build a test asserting its actual return value."""
+    generated = generate_reference_output_test(candidate, function_name, input_args, input_kwargs, test_number)
+    if generated["status"] != "passed":
+        return {"status": "rejected", "error": generated["error"]}
+    result = validate_generated_test(candidate, generated["test"], function_name)
+    if result["status"] != "passed":
+        error = f"reference-output test did not pass validation: {result.get('error', result['status'])}"
+        return {"status": "rejected", "error": error}
+    if result["fingerprint"] in fingerprints:
+        return {"status": "rejected", "error": "duplicate test"}
+    fingerprints.add(result["fingerprint"])
+    return {
+        "status": "accepted", "test": generated["test"], "test_name": generated["test_name"],
+        "output": generated["output"],
+    }
+
+
 def evaluate_generated_tests_v2(
     check_requirement: Callable[[str], str],
     requirement: str,
@@ -175,18 +220,9 @@ def evaluate_generated_tests_v2(
     """Generate a reference and collect passing tests before evaluating submitted code."""
     if num_tests < 1 or max_attempts < 1:
         raise ValueError("number of tests and maximum attempts must be positive")
-    signature, output_format = parse_function_signature(
-        check_requirement(construct_signature_prompt(requirement, submitted_code)), submitted_code
+    signature, output_format, function_name, candidate = prepare_reference(
+        check_requirement, requirement, submitted_code, delay
     )
-    function_name = function_name_from_signature(signature)
-    if delay:
-        time.sleep(delay)
-    candidate_raw = check_requirement(construct_candidate_prompt(requirement, signature, output_format))
-    candidate = extract_code_block(candidate_raw)
-    if not candidate:
-        raise ValueError("model returned an empty candidate implementation")
-    validate_candidate_signature(candidate, signature)
-    check_generated_candidate(candidate)
 
     accepted: List[Tuple[str, str]] = []
     previous_tests: List[str] = []
@@ -199,7 +235,7 @@ def evaluate_generated_tests_v2(
             requirement, signature, output_format, previous_tests, attempt
         )
         response = check_requirement(prompt)
-        tests = extract_generated_tests(response)
+        tests = extract_test(response)
         result = validate_generated_test(candidate, tests, function_name)
         feedback = {
             "status": result["status"],
@@ -259,23 +295,16 @@ def evaluate_generated_tests_v2(
                 error = "duplicate input"
             else:
                 seen_inputs.add(input_key)
-                generated = generate_reference_output_test(
-                    candidate, function_name, input_args, input_kwargs, len(accepted) + 1
+                built = build_reference_output_test(
+                    candidate, function_name, input_args, input_kwargs, len(accepted) + 1, fingerprints
                 )
-                if generated["status"] != "passed":
-                    error = generated["error"]
+                if built["status"] != "accepted":
+                    error = built["error"]
                 else:
-                    result = validate_generated_test(candidate, generated["test"], function_name)
-                    if result["status"] != "passed":
-                        error = f"reference-output test did not pass validation: {result.get('error', result['status'])}"
-                    elif result["fingerprint"] in fingerprints:
-                        error = "duplicate test"
-                    else:
-                        fingerprints.add(result["fingerprint"])
-                        accepted.append((generated["test"], generated["test_name"]))
-                        test_sources.append("reference_output")
-                        previous_inputs.append(f"{input_response}\nAccepted")
-                        continue
+                    accepted.append((built["test"], built["test_name"]))
+                    test_sources.append("reference_output")
+                    previous_inputs.append(f"{input_response}\nAccepted")
+                    continue
         reference_excluded.append({"attempt": reference_attempts, "input": input_response, "error": error})
         previous_inputs.append(f"{input_response}\nRejected: {error}")
 
@@ -297,6 +326,56 @@ def evaluate_generated_tests_v2(
     }
 
 
+def evaluate_generated_tests_v3(
+    check_requirement: Callable[[str], str],
+    requirement: str,
+    submitted_code: str,
+    num_tests: int,
+    delay: float,
+) -> Tuple[str, Dict[str, Any]]:
+    """Build one test per model-chosen input from the reference implementation's actual output.
+
+    The model never writes expected values: it implements the requirement and proposes
+    inputs, and each assertion's expected value is the reference's actual return value.
+    """
+    if num_tests < 1:
+        raise ValueError("number of tests must be positive")
+    signature, output_format, function_name, candidate = prepare_reference(
+        check_requirement, requirement, submitted_code, delay
+    )
+    if delay:
+        time.sleep(delay)
+    inputs = parse_reference_inputs(
+        check_requirement(construct_reference_inputs_prompt(requirement, signature, num_tests)), num_tests
+    )
+
+    tests: List[Tuple[str, str]] = []
+    outputs: List[str] = []
+    for number, (input_args, input_kwargs) in enumerate(inputs, start=1):
+        generated = generate_reference_output_test(candidate, function_name, input_args, input_kwargs, number)
+        if generated["status"] != "passed":
+            raise RuntimeError(
+                f"reference implementation failed on input {number} "
+                f"(args={input_args!r}, kwargs={input_kwargs!r}): {generated['error']}"
+            )
+        tests.append((generated["test"], generated["test_name"]))
+        outputs.append(generated["output"])
+
+    report = run_validated_tests(submitted_code, tests)
+    pred = "YES" if report["failed"] == 0 else "NO"
+    return pred, {
+        "function_signature": signature,
+        "output_format": output_format,
+        "function_name": function_name,
+        "candidate_implementation": candidate,
+        "inputs": [{"args": input_args, "kwargs": input_kwargs} for input_args, input_kwargs in inputs],
+        "generated_tests": [test for test, _ in tests],
+        "test_sources": ["reference_output"] * len(tests),
+        "reference_outputs": outputs,
+        "execution": report,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, help="Path to paired dataset (JSON/JSONL)")
@@ -308,13 +387,13 @@ def main() -> None:
         "--prompt_modes",
         nargs="+",
         default=DEFAULT_PROMPT_MODES,
-        help="Prompt modes: direct, direct_explain, full, generated_tests, generated_tests_v2",
+        help="Prompt modes: direct, direct_explain, full, generated_tests, generated_tests_v2, generated_tests_v3",
     )
 
     ap.add_argument("--delay", type=float, default=0.5, help="Sleep between API calls")
     ap.add_argument("--max_items", type=int, default=0, help="Debug: limit number of expanded samples (0 = all)")
     ap.add_argument("--continue_on_error", action="store_true", help="Continue even if a model call fails")
-    ap.add_argument("--num_unit_tests", type=int, default=5, help="Number of passing tests required for generated_tests_v2")
+    ap.add_argument("--num_unit_tests", type=int, default=5, help="Number of tests to build for generated_tests_v2 and generated_tests_v3")
     ap.add_argument("--max_test_attempts", type=int, default=10, help="Maximum test-generation calls for generated_tests_v2 (0 = 10 times the requested count)")
 
     args = ap.parse_args()
@@ -378,6 +457,12 @@ def main() -> None:
                             args.delay,
                         )
                         raw = json.dumps(details, ensure_ascii=False)
+                    elif mode == "generated_tests_v3":
+                        pred, details = evaluate_generated_tests_v3(
+                            model.check_requirement, s["requirement"], s["code"],
+                            args.num_unit_tests, args.delay,
+                        )
+                        raw = json.dumps(details, ensure_ascii=False)
                     else:
                         prompt = construct_prompt(s["requirement"], s["code"], mode=mode)
                         raw = model.check_requirement(prompt)
@@ -389,7 +474,7 @@ def main() -> None:
                             {"generated_tests": raw, "extracted_tests": tests, "execution": report},
                             ensure_ascii=False,
                         )
-                    elif mode != "generated_tests_v2":
+                    elif mode not in ("generated_tests_v2", "generated_tests_v3"):
                         pred = parse_response(raw)
                 except MissingGeneratedModuleError:
                     raise

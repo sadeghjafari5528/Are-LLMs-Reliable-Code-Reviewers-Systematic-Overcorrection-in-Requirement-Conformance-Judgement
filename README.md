@@ -136,6 +136,18 @@ saved with an empty prediction. Checkpoints are keyed by task, variant and mode,
 not test count or retry limit; use a fresh output directory to rerun with
 different settings or retry a saved error.
 
+**Response format.** Every prompt in these modes specifies an exact tagged
+output format: `<signature>` and `<output_format>` for the signature step,
+`<code>` for the reference implementation, `<test>` for a generated test, and
+`<input>` / `<inputs>` for inputs (inputs are written as `{"args": [...],
+"kwargs": {...}}`). The parsers look for the tagged content anywhere in the
+response, so explanations before or after it are ignored; tags may wrap a
+fenced code block. If the tags are missing they fall back to a fenced code block
+(and, for the signature step, the older `OUTPUT:` line). Inputs may be JSON or
+Python literals, including comments, `true`/`false`/`null`, and `'a' * 3`. A
+parse error includes the start of the response it received. A response that was
+cut off by the model's token limit cannot be recovered and raises such an error.
+
 **Security:** generated implementations and tests execute arbitrary Python in
 subprocesses with the current user's permissions. Timeouts are not a security
 sandbox; run this mode only in an appropriately isolated environment.
@@ -146,6 +158,33 @@ The error names the missing module so you can install the corresponding package
 in the environment running the script and rerun. Import names and package names
 can differ. Top-level imports are checked before requesting tests; imports
 inside functions are detected when those functions are called.
+
+### Generated tests v3
+
+`--prompt_modes generated_tests_v3` never asks the model to write expected
+values. It uses the same signature and output-format extraction and the same
+generated reference implementation as v2, then asks the model for
+`--num_unit_tests` inputs (as `args`/`kwargs`) in a single request. The
+reference is run on each input, and each test asserts the reference's actual
+return value, e.g. `assert double(3) == 6`. All tests are then run on the
+submitted implementation: all must pass for a YES verdict. A normal run makes
+three model calls: signature, reference implementation, and inputs.
+
+Inputs are not filtered or retried: the model must return exactly
+`--num_unit_tests` valid inputs in one response, and the reference must return
+a plain Python literal (finite numbers, strings, bytes, lists, tuples, sets,
+dicts, booleans, `None`) for every one of them. Otherwise the run raises an
+error naming the problem (for example, the reference raising on an input),
+which with `--continue_on_error` is saved with an empty prediction. Saved
+results include `inputs`, `generated_tests`, `reference_outputs`, and
+`test_sources` (always `reference_output`) next to the execution report.
+
+Because expected values come from the reference, a mistake in the reference
+implementation becomes a wrong expectation, and the tests only check that the
+submitted code agrees with the reference. Exact equality is used, so correct
+implementations that differ in floating-point rounding can fail. The security
+and missing-module notes above apply. Checkpoints are keyed by task, variant and
+mode, so a fresh output directory is needed to rerun with different settings.
 
 ---
 

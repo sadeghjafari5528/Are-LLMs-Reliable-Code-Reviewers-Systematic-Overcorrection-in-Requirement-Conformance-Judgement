@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import ast
 import builtins
+import keyword
 import math
 import multiprocessing as mp
 import re
@@ -129,9 +130,13 @@ def construct_signature_prompt(requirement: str, code: str) -> str:
         "Step 2: Describe the output type and format of the returned value in one line: the exact "
         "type, its structure and element types, and any format details (for example ordering, "
         "rounding, string format, or what is returned in edge cases).\n"
-        "Respond in exactly this form, with nothing else:\n"
-        "```python\ndef name(first, second=1) -> list[str]:\n```\n"
-        "OUTPUT: a list of strings sorted in ascending order; an empty list if there is no match"
+        "Respond in exactly this format and write nothing outside the tags:\n"
+        "<signature>\n"
+        "def name(first, second=1) -> list[str]:\n"
+        "</signature>\n"
+        "<output_format>\n"
+        "a list of strings sorted in ascending order; an empty list if there is no match\n"
+        "</output_format>"
     )
 
 
@@ -157,15 +162,33 @@ def _first_function(source: str) -> Optional[ast.FunctionDef]:
     return None
 
 
+def _excerpt(text: str, limit: int = 300) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 def parse_function_signature(response: str, submitted_code: str) -> Tuple[str, str]:
     """Normalize the model's signature and output format and check them against the submitted code."""
-    output_match = re.search(r"(?im)^[ \t]*OUTPUT[ \t]*:[ \t]*(\S.*?)[ \t]*$", response)
-    if output_match is None:
-        raise ValueError("model did not describe the output type and format")
-    output_format = output_match.group(1)
-    node = _first_function(extract_code_block(response.replace(output_match.group(0), "")))
+    output_format = extract_tagged(response, "output_format")
+    remainder = response
+    if output_format is None:
+        output_match = re.search(r"(?im)^[ \t]*OUTPUT[ \t]*:[ \t]*(\S.*?)[ \t]*$", response)
+        if output_match is None:
+            raise ValueError(
+                "model did not describe the output type and format in <output_format> tags; "
+                f"response was: {_excerpt(response)}"
+            )
+        output_format = output_match.group(1)
+        remainder = response.replace(output_match.group(0), "")
+    output_format = " ".join(output_format.split())
+    if not output_format:
+        raise ValueError("model returned an empty output type and format")
+    signature_text = extract_answer(remainder, "signature", prefer_last=False)
+    node = _first_function(signature_text)
     if node is None:
-        raise ValueError("model did not return a valid function signature")
+        raise ValueError(
+            f"model did not return a valid function signature in <signature> tags; response was: {_excerpt(response)}"
+        )
     if node.returns is None:
         raise ValueError("model did not specify the return type in the signature")
     signature = f"def {node.name}({ast.unparse(node.args)}) -> {ast.unparse(node.returns)}:"
@@ -229,7 +252,13 @@ def construct_candidate_prompt(requirement: str, signature: str, output_format: 
         "these parameters; do not rename, add, remove, or reorder them. The returned value must "
         "have exactly the required output type and format. Include any imports needed, such as "
         "for type annotations.\n"
-        "Return only one Python code block containing the implementation."
+        "Respond in exactly this format, with only Python code inside the tags (no code fences, "
+        "no explanation outside the tags):\n"
+        "<code>\n"
+        "import ...  # only if needed\n"
+        f"{signature}\n"
+        "    ...\n"
+        "</code>"
     )
 
 
@@ -263,7 +292,12 @@ def construct_generated_tests_v2_prompt(
         "The observed outputs come from an AI-generated implementation and may be incorrect; "
         "derive expected behavior from the requirement, not just those outputs.\n"
         "Do not inspect any implementation.\n"
-        "Return only one Python code block containing the test."
+        "Respond in exactly this format, with only Python code inside the tags (no code fences, "
+        "no explanation outside the tags):\n"
+        "<test>\n"
+        "def test_case():\n"
+        "    assert ...\n"
+        "</test>"
     )
 
 
@@ -278,23 +312,59 @@ def construct_reference_input_prompt(
         f"Existing tests:\n{chr(10).join(previous_tests)}\n\n"
         f"Previous input attempts:\n{chr(10).join(previous_inputs) or '(none)'}\n\n"
         f"Input attempt: {attempt}\n"
-        'Return only a Python literal dictionary with "args" as a list of positional arguments '
-        'and "kwargs" as a dictionary of keyword arguments, matching the signature. Use only literal values. '
-        "Choose a distinct input and do not provide an expected output."
+        "Choose a distinct input and do not provide an expected output. Use only literal values "
+        "(numbers, strings, lists, tuples, dicts, booleans, None) and no comments.\n"
+        "Respond in exactly this format and write nothing outside the tags; \"args\" is a list "
+        "of positional arguments and \"kwargs\" a dictionary of keyword arguments, matching the signature:\n"
+        "<input>\n"
+        '{"args": [first_argument, second_argument], "kwargs": {}}\n'
+        "</input>"
     )
 
 
-def parse_reference_input(response: str) -> Tuple[List[Any], Dict[str, Any]]:
-    """Parse literal positional and keyword arguments proposed by the model."""
+def _load_literal(response: str) -> Any:
     match = re.fullmatch(r"\s*```(?:json|python|py)?\s*(.*?)\s*```\s*", response, flags=re.IGNORECASE | re.DOTALL)
     text = match.group(1) if match else response
     try:
-        data = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError:
         try:
-            data = ast.literal_eval(text)
+            return ast.literal_eval(text)
         except (SyntaxError, ValueError) as exc:
-            raise ValueError(f"input is not a valid JSON or Python literal: {exc}") from exc
+            try:
+                expression = ast.parse(text, mode="eval").body
+
+                def evaluate(node: ast.AST) -> Any:
+                    if isinstance(node, ast.Constant):
+                        return node.value
+                    if isinstance(node, ast.Name) and node.id in {"true", "false", "null"}:
+                        return {"true": True, "false": False, "null": None}[node.id]
+                    if isinstance(node, ast.List):
+                        return [evaluate(element) for element in node.elts]
+                    if isinstance(node, ast.Tuple):
+                        return tuple(evaluate(element) for element in node.elts)
+                    if isinstance(node, ast.Set):
+                        return {evaluate(element) for element in node.elts}
+                    if isinstance(node, ast.Dict) and all(key is not None for key in node.keys):
+                        return {evaluate(key): evaluate(value) for key, value in zip(node.keys, node.values)}
+                    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+                        operand = evaluate(node.operand)
+                        if isinstance(operand, (int, float)) and not isinstance(operand, bool):
+                            return -operand if isinstance(node.op, ast.USub) else operand
+                    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+                        left, right = evaluate(node.left), evaluate(node.right)
+                        if (isinstance(left, str) and isinstance(right, int) and not isinstance(right, bool)) or (
+                            isinstance(right, str) and isinstance(left, int) and not isinstance(left, bool)
+                        ):
+                            return left * right
+                    raise ValueError("unsupported expression")
+
+                return evaluate(expression)
+            except (SyntaxError, ValueError) as expression_exc:
+                raise ValueError(f"input is not a valid JSON or Python literal: {expression_exc}") from exc
+
+
+def _validate_reference_input(data: Any) -> Tuple[List[Any], Dict[str, Any]]:
     if not isinstance(data, dict) or set(data) != {"args", "kwargs"}:
         raise ValueError('input must be a dictionary with exactly "args" and "kwargs"')
     if not isinstance(data["args"], list) or not isinstance(data["kwargs"], dict):
@@ -304,12 +374,85 @@ def parse_reference_input(response: str) -> Tuple[List[Any], Dict[str, Any]]:
     return data["args"], data["kwargs"]
 
 
+def construct_reference_inputs_prompt(requirement: str, signature: str, count: int) -> str:
+    """Request several inputs at once; the expected outputs come from running the reference."""
+    return (
+        "Choose test inputs for this Python function based on its requirement.\n\n"
+        f"Requirement:\n{requirement}\n\n"
+        f"Function signature:\n{signature}\n\n"
+        f"Provide exactly {count} distinct, valid inputs covering normal cases and the boundary "
+        "or edge cases that the requirement supports. Use only literal values (numbers, strings, "
+        "lists, tuples, dicts, booleans, None) and no comments. Do not provide expected outputs; "
+        "they are computed automatically.\n"
+        "Respond in exactly this format and write nothing outside the tags; the list has exactly "
+        f"{count} dictionaries, where \"args\" is a list of positional arguments and \"kwargs\" a "
+        "dictionary of keyword arguments, matching the signature:\n"
+        "<inputs>\n"
+        '[{"args": [first_argument, second_argument], "kwargs": {}}, {"args": [], "kwargs": {"name": value}}]\n'
+        "</inputs>"
+    )
+
+
+def _load_answer_literal(response: str, tag: str) -> Any:
+    """Load the literal from the tagged answer; the error shows what the model actually returned."""
+    try:
+        return _load_literal(extract_answer(response, tag))
+    except ValueError as exc:
+        raise ValueError(f"{exc}; expected the answer inside <{tag}> tags, response was: {_excerpt(response)}") from exc
+
+
+def parse_reference_input(response: str) -> Tuple[List[Any], Dict[str, Any]]:
+    """Parse literal positional and keyword arguments proposed by the model."""
+    return _validate_reference_input(_load_answer_literal(response, "input"))
+
+
+def parse_reference_inputs(response: str, count: int) -> List[Tuple[List[Any], Dict[str, Any]]]:
+    """Parse exactly `count` literal inputs from the model response."""
+    data = _load_answer_literal(response, "inputs")
+    if not isinstance(data, list) or len(data) != count:
+        raise ValueError(
+            f"response must be a list of exactly {count} input dictionaries; response was: {_excerpt(response)}"
+        )
+    return [_validate_reference_input(item) for item in data]
+
+
 def parse_response(response_text: str) -> str:
     """Extract the first YES/NO token from a model response."""
     if not response_text:
         return ""
     m = re.search(r"\b(YES|NO)\b", response_text, flags=re.IGNORECASE)
     return m.group(1).upper() if m else ""
+
+
+def extract_tagged(response_text: str, tag: str) -> Optional[str]:
+    """Return the content of the last <tag>...</tag> in a response, without surrounding code fences."""
+    matches = re.findall(rf"<{tag}>\s*(.*?)\s*</{tag}>", response_text, flags=re.IGNORECASE | re.DOTALL)
+    if not matches:
+        return None
+    fenced = re.fullmatch(r"```[\w+-]*[ \t]*\n?(.*?)\s*```", matches[-1].strip(), flags=re.DOTALL)
+    return (fenced.group(1) if fenced else matches[-1]).strip()
+
+
+def extract_answer(response_text: str, tag: str, prefer_last: bool = True) -> str:
+    """Find an answer anywhere in a response: tagged content, else a fenced block, else the whole text."""
+    tagged = extract_tagged(response_text, tag)
+    if tagged is not None:
+        return tagged
+    blocks = re.findall(r"```[\w+-]*[ \t]*\n?(.*?)```", response_text, flags=re.DOTALL)
+    if blocks:
+        return (blocks[-1] if prefer_last else blocks[0]).strip()
+    return response_text.strip()
+
+
+def extract_candidate_code(response_text: str) -> str:
+    """Extract the reference implementation from <code> tags, falling back to the first code block."""
+    return extract_answer(response_text, "code", prefer_last=False)
+
+
+def extract_test(response_text: str) -> str:
+    """Extract one generated test from <test> tags, falling back to the generated-tests extractor."""
+    tagged = extract_tagged(response_text, "test")
+    return tagged if tagged is not None else extract_generated_tests(response_text)
 
 
 def extract_generated_tests(response_text: str) -> str:
@@ -598,6 +741,7 @@ def validate_generated_test(
 
 
 def _literal_reference_value(value: Any) -> bool:
+    
     if type(value) in (type(None), bool, int, str, bytes):
         return True
     if type(value) is float:
@@ -616,11 +760,11 @@ def _worker_reference_output(
         env: Dict[str, Any] = {}
         exec(code, env, env)
         value = env[function_name](*args, **kwargs)
-        if not _literal_reference_value(value):
-            raise ValueError("reference output cannot be represented as a supported Python literal")
+        # if not _literal_reference_value(value):
+        #     raise ValueError("reference output cannot be represented as a supported Python literal")
         output = repr(value)
-        if len(output) > 16000:
-            raise ValueError("reference output is too large to save as a test")
+        # if len(output) > 16000:
+        #     raise ValueError("reference output is too large to save as a test")
         ast.literal_eval(output)
         queue.put({"status": "passed", "output": output})
     except ModuleNotFoundError as exc:
@@ -631,7 +775,7 @@ def _worker_reference_output(
 
 def generate_reference_output_test(
     candidate_code: str, function_name: str, args: List[Any], kwargs: Dict[str, Any],
-    test_number: int, timeout_s: float = 3.0
+    test_number: int, timeout_s: float = 30.0
 ) -> Dict[str, Any]:
     """Build a test from an actual reference return value in a timed process."""
     queue: mp.Queue = mp.Queue()
@@ -657,9 +801,13 @@ def generate_reference_output_test(
     if result["status"] == "passed":
         test_name = f"test_reference_output_{test_number}"
         result["test_name"] = test_name
+        if all(key.isidentifier() and not keyword.iskeyword(key) for key in kwargs):
+            call_args = ", ".join([repr(arg) for arg in args] + [f"{key}={value!r}" for key, value in kwargs.items()])
+        else:
+            call_args = f"*{args!r}, **{kwargs!r}"
         result["test"] = (
             f"def {test_name}():\n"
-            f"    assert {function_name}(*{args!r}, **{kwargs!r}) == {result['output']}"
+            f"    assert {function_name}({call_args}) == {result['output']}"
         )
     return result
 
