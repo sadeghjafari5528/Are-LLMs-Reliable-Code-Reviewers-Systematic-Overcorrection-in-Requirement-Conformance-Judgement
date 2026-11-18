@@ -82,6 +82,22 @@ Outputs:
 - `outputs/<benchmark>/<benchmark>__<model>__baseline.jsonl` (append-only checkpoint)
 - `outputs/<benchmark>/<benchmark>__<model>__baseline.json` (final array)
 
+### Agreement across prompt methods
+
+Compare the saved predictions from `direct` and `generated_tests_v3` without
+making LLM calls:
+
+```bash
+python code/agreement.py
+```
+
+By default, this uses the Humaneval GPT-4o baseline files in `outputs/`. For
+each row present in both methods, the final verdict is YES only when both
+predict YES; a disagreement (1-1) resolves to NO. The script reports
+majority-vote accuracy against the dataset labels, overall and by variant. Use
+`--baseline-results` and `--generated-tests-v3-results` to supply other JSON or
+JSONL result files.
+
 ### Generated tests v2
 
 Use `--prompt_modes generated_tests_v2 --num_unit_tests 5` to generate a

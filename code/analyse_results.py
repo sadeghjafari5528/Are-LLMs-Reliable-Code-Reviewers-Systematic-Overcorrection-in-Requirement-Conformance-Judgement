@@ -79,7 +79,7 @@ def print_metrics(name: str, rows: list[dict[str, Any]]) -> None:
 
 
 def main() -> None:
-	path = Path("outputs/humaneval/humaneval__gpt-4o__baseline.jsonl")
+	path = Path("outputs/humaneval/humaneval__gpt-4o__baseline_v1.jsonl")
 
 	rows = list(read_jsonl(path))
 	print_metrics("Overall", rows)
